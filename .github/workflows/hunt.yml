@@ -1,0 +1,79 @@
+name: Hunt Oracle ARM (A1.Flex) capacity
+
+on:
+  # Run on a schedule. GitHub's cron is UTC and can lag a few minutes;
+  # this fires every 15 minutes to keep pressure on AD-1.
+  schedule:
+    - cron: '*/15 * * * *'
+  # Allow manual runs from the Actions tab / CLI.
+  workflow_dispatch:
+    inputs:
+      max_attempts:
+        description: 'How many launch attempts per run'
+        required: false
+        default: '20'
+      sleep_seconds:
+        description: 'Seconds between attempts'
+        required: false
+        default: '45'
+
+concurrency:
+  # Never let two hunters fight each other (and trip Oracle's rate limits).
+  group: oci-arm-hunter
+  cancel-in-progress: false
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OCI CLI
+        run: |
+          python3 -m pip install --quiet --upgrade pip
+          python3 -m pip install --quiet oci-cli
+          oci --version
+
+      - name: Write API private key
+        env:
+          OCI_API_PRIVATE_KEY: ${{ secrets.OCI_API_PRIVATE_KEY }}
+        run: |
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_API_PRIVATE_KEY" > "$HOME/.oci/oci_api_key.pem"
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+          # sanity: make sure it looks like a PEM key
+          head -1 "$HOME/.oci/oci_api_key.pem"
+
+      - name: Hunt for capacity
+        id: hunt
+        env:
+          OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+          OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+          OCI_CLI_KEY_FILE: ${{ github.workspace }}/.oci_key.pem
+          OCI_CLI_REGION: ${{ vars.OCI_CLI_REGION || 'us-sanjose-1' }}
+          AD: ${{ vars.OCI_AD || 'pUWP:US-SANJOSE-1-AD-1' }}
+          SUBNET_OCID: ${{ vars.OCI_SUBNET_OCID }}
+          IMAGE_OCID: ${{ vars.OCI_IMAGE_OCID }}
+          INSTANCE_NAME: ${{ vars.OCI_INSTANCE_NAME || 'ubuntu-arm-free' }}
+          OCPUS: ${{ vars.OCI_OCPUS || '2' }}
+          MEMORY_GB: ${{ vars.OCI_MEMORY_GB || '12' }}
+          MAX_ATTEMPTS: ${{ github.event.inputs.max_attempts || '20' }}
+          SLEEP_SECONDS: ${{ github.event.inputs.sleep_seconds || '45' }}
+        run: |
+          cp "$HOME/.oci/oci_api_key.pem" "$OCI_CLI_KEY_FILE"
+          chmod 600 "$OCI_CLI_KEY_FILE"
+          bash scripts/hunt.sh
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Oracle ARM hunt"
+            echo ""
+            echo "- result: \`${{ steps.hunt.outputs.created }}\`"
+            echo "- instance id: \`${{ steps.hunt.outputs.instance_id }}\`"
+            echo "- ran at: $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+          } >> "$GITHUB_STEP_SUMMARY"
