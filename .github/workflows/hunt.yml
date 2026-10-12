@@ -24,16 +24,26 @@ concurrency:
 
 jobs:
   hunt:
-    runs-on: ubuntu-latest
+    # Self-hosted runner on the Lightsail VPS: no Actions minutes consumed.
+    runs-on: [self-hosted, linux, lightsail]
     timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install OCI CLI
+      - name: Ensure OCI CLI
         run: |
-          python3 -m pip install --quiet --upgrade pip
-          python3 -m pip install --quiet oci-cli
+          if command -v oci >/dev/null 2>&1; then
+            oci --version
+            exit 0
+          fi
+          if command -v pip3 >/dev/null 2>&1; then
+            pip3 install --quiet --user oci-cli || pip3 install --quiet --break-system-packages oci-cli
+          fi
+          if ! command -v oci >/dev/null 2>&1; then
+            echo "::error::oci CLI unavailable on this runner"
+            exit 1
+          fi
           oci --version
 
       - name: Write API private key
