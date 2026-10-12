@@ -16,11 +16,11 @@ on:
       max_attempts:
         description: 'How many launch attempts per run'
         required: false
-        default: '10'
+        default: '30'
       sleep_seconds:
         description: 'Seconds between attempts'
         required: false
-        default: '30'
+        default: '3'
 
 concurrency:
   # Never let two hunters fight each other (and trip Oracle's rate limits).
@@ -41,11 +41,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install OCI CLI
+      - name: Install OCI SDK
         run: |
           python3 -m pip install --quiet --upgrade pip
-          python3 -m pip install --quiet oci-cli
-          oci --version
+          # The SDK only, not oci-cli: the CLI's built-in retries made every
+          # capacity check block for ~100s. See scripts/hunt.py.
+          python3 -m pip install --quiet oci
+          python3 -c "import oci; print('oci sdk', oci.__version__)"
 
       - name: Write API private key
         env:
@@ -71,14 +73,14 @@ jobs:
           INSTANCE_NAME: ${{ vars.OCI_INSTANCE_NAME || 'ubuntu-arm-free' }}
           OCPUS: ${{ vars.OCI_OCPUS || '2' }}
           MEMORY_GB: ${{ vars.OCI_MEMORY_GB || '12' }}
-          # Keep one run short: with a 5-minute cron, a long run would
-          # overlap the next one and the queue would grow.
-          MAX_ATTEMPTS: ${{ github.event.inputs.max_attempts || '6' }}
-          SLEEP_SECONDS: ${{ github.event.inputs.sleep_seconds || '30' }}
+          # With ~1s per attempt, many attempts still finish fast. The job
+          # timeout below is the real guard against overlapping the cron.
+          MAX_ATTEMPTS: ${{ github.event.inputs.max_attempts || '30' }}
+          SLEEP_SECONDS: ${{ github.event.inputs.sleep_seconds || '3' }}
         run: |
           cp "$HOME/.oci/oci_api_key.pem" "$OCI_CLI_KEY_FILE"
           chmod 600 "$OCI_CLI_KEY_FILE"
-          bash scripts/hunt.sh
+          python3 scripts/hunt.py
 
       - name: Summary
         if: always()
