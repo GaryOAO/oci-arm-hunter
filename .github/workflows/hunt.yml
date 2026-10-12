@@ -35,7 +35,8 @@ jobs:
     # free and unlimited. (The Lightsail self-hosted runner is reserved for
     # the private claude-oauth-proxy repo, whose minutes are metered.)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # Well under the 5-minute cron interval, so runs cannot pile up.
+    timeout-minutes: 8
 
     steps:
       - uses: actions/checkout@v4
@@ -70,8 +71,10 @@ jobs:
           INSTANCE_NAME: ${{ vars.OCI_INSTANCE_NAME || 'ubuntu-arm-free' }}
           OCPUS: ${{ vars.OCI_OCPUS || '2' }}
           MEMORY_GB: ${{ vars.OCI_MEMORY_GB || '12' }}
-          MAX_ATTEMPTS: ${{ github.event.inputs.max_attempts || '20' }}
-          SLEEP_SECONDS: ${{ github.event.inputs.sleep_seconds || '45' }}
+          # Keep one run short: with a 5-minute cron, a long run would
+          # overlap the next one and the queue would grow.
+          MAX_ATTEMPTS: ${{ github.event.inputs.max_attempts || '6' }}
+          SLEEP_SECONDS: ${{ github.event.inputs.sleep_seconds || '30' }}
         run: |
           cp "$HOME/.oci/oci_api_key.pem" "$OCI_CLI_KEY_FILE"
           chmod 600 "$OCI_CLI_KEY_FILE"
