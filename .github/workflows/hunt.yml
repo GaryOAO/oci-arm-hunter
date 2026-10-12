@@ -19,8 +19,10 @@ on:
 
 concurrency:
   # Never let two hunters fight each other (and trip Oracle's rate limits).
+  # cancel-in-progress: true means a newer run supersedes a stuck/queued one,
+  # so a job that never obtains a runner cannot block the queue forever.
   group: oci-arm-hunter
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   hunt:
