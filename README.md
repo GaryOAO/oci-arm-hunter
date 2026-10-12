@@ -40,11 +40,23 @@ Oracle Cloud 的 `VM.Standard.A1.Flex`（ARM，永久免费 2 OCPU / 12 GB）在
 ```
 region      us-sanjose-1
 AD          pUWP:US-SANJOSE-1-AD-1
-
-SUBNET_OCID ocid1.subnet.oc1.us-sanjose-1.aaaaaaaa2o42mjyslisjw5lvrtamam5r4ell4cmymeusrqjmdyjym2pifevq
-IMAGE_OCID  ocid1.image.oc1.us-sanjose-1.aaaaaaaawpuh2omgoyqorcgzyrozpjgi55rker4nblvxrtanzwtc6jchgoba
-            (Canonical-Ubuntu-24.04-aarch64-2026.09.18-0)
+IMAGE       Canonical-Ubuntu-24.04-aarch64（用 aarch64 版本才匹配 ARM 机型）
 ```
+
+`OCI_SUBNET_OCID` 和 `OCI_IMAGE_OCID` 请从自己的控制台获取：
+
+- **子网**：Networking → Virtual cloud networks → 你的 VCN → Subnets → 复制 OCID
+- **镜像**：Compute → Instances → Create instance → 选好 Ubuntu 24.04 (aarch64) 后，
+  从浏览器网络请求里取，或用 CLI：
+
+  ```bash
+  oci compute image list \
+    --compartment-id <tenancy-ocid> \
+    --operating-system "Canonical Ubuntu" \
+    --shape VM.Standard.A1.Flex \
+    --query "data[?contains(\"display-name\",'24.04')].{name:\"display-name\",id:id}" \
+    --output table
+  ```
 
 ## 手动触发
 
