@@ -1,21 +1,26 @@
 name: Hunt Oracle ARM (A1.Flex) capacity
 
 on:
-  # Run on a schedule. GitHub's cron is UTC and can lag a few minutes;
-  # this fires every 15 minutes to keep pressure on AD-1.
+  # Poll every 5 minutes. This repository is public, so GitHub-hosted
+  # minutes are free and unlimited, and there is no reason to be sparing.
+  #
+  # Caveats, both inherent to GitHub cron:
+  #   - 5 minutes is the shortest interval GitHub supports.
+  #   - Scheduled runs are queued on a shared pool and routinely start a
+  #     few minutes late, especially on the hour.
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/5 * * * *'
   # Allow manual runs from the Actions tab / CLI.
   workflow_dispatch:
     inputs:
       max_attempts:
         description: 'How many launch attempts per run'
         required: false
-        default: '20'
+        default: '10'
       sleep_seconds:
         description: 'Seconds between attempts'
         required: false
-        default: '45'
+        default: '30'
 
 concurrency:
   # Never let two hunters fight each other (and trip Oracle's rate limits).
