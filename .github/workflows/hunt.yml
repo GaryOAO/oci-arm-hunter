@@ -1,53 +1,50 @@
-name: Hunt Oracle ARM (A1.Flex) capacity
+name: Hunt Oracle Always Free capacity (ARM + x86)
 
 on:
-  # Poll every 5 minutes. This repository is public, so GitHub-hosted
-  # minutes are free and unlimited, and there is no reason to be sparing.
-  #
-  # Caveats, both inherent to GitHub cron:
-  #   - 5 minutes is the shortest interval GitHub supports.
-  #   - Scheduled runs are queued on a shared pool and routinely start a
-  #     few minutes late, especially on the hour.
+  # A long polling window bridges GitHub's delayed scheduled events.
   schedule:
-    - cron: '*/5 * * * *'
-  # Allow manual runs from the Actions tab / CLI.
+    - cron: '17,47 * * * *'
   workflow_dispatch:
     inputs:
       max_attempts:
-        description: 'How many launch attempts per run'
-        required: false
-        default: '30'
+        description: 'Launch attempts (0 = until runtime limit)'
+        default: '0'
       sleep_seconds:
-        description: 'Seconds between attempts'
-        required: false
-        default: '3'
+        description: 'Minimum delay between attempts (at least 10 seconds)'
+        default: '15'
+      max_runtime_seconds:
+        description: 'Polling window in seconds (1–3300)'
+        default: '3300'
+
+permissions:
+  contents: read
 
 concurrency:
-  # Never let two hunters fight each other (and trip Oracle's rate limits).
-  # cancel-in-progress: true means a newer run supersedes a stuck/queued one,
-  # so a job that never obtains a runner cannot block the queue forever.
   group: oci-arm-hunter
-  cancel-in-progress: true
+  # Keep the active hunter alive; one pending job continues after it finishes.
+  cancel-in-progress: false
 
 jobs:
   hunt:
-    # GitHub-hosted runner. This repository is public, so hosted minutes are
-    # free and unlimited. (The Lightsail self-hosted runner is reserved for
-    # the private claude-oauth-proxy repo, whose minutes are metered.)
     runs-on: ubuntu-latest
-    # Well under the 5-minute cron interval, so runs cannot pile up.
-    timeout-minutes: 8
-
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
       - name: Install OCI SDK
-        run: |
-          python3 -m pip install --quiet --upgrade pip
-          # The SDK only, not oci-cli: the CLI's built-in retries made every
-          # capacity check block for ~100s. See scripts/hunt.py.
-          python3 -m pip install --quiet oci
-          python3 -c "import oci; print('oci sdk', oci.__version__)"
+        run: python -m pip install --quiet -r requirements.txt
+      - name: Test hunter
+        run: python -m unittest discover -s tests -v
+
+      # No credentials are cached, only pending request metadata/retry token.
+      - uses: actions/cache/restore@v4
+        with:
+          path: .hunt-state
+          key: oci-hunt-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: oci-hunt-state-v1-
 
       - name: Write API private key
         env:
@@ -56,39 +53,60 @@ jobs:
           mkdir -p "$HOME/.oci"
           printf '%s\n' "$OCI_API_PRIVATE_KEY" > "$HOME/.oci/oci_api_key.pem"
           chmod 600 "$HOME/.oci/oci_api_key.pem"
-          # sanity: make sure it looks like a PEM key
-          head -1 "$HOME/.oci/oci_api_key.pem"
 
-      - name: Hunt for capacity
+      - name: Hunt for free capacity
         id: hunt
         env:
           OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
           OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
           OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
-          OCI_CLI_KEY_FILE: ${{ github.workspace }}/.oci_key.pem
           OCI_CLI_REGION: ${{ vars.OCI_CLI_REGION || 'us-sanjose-1' }}
-          AD: ${{ vars.OCI_AD || 'pUWP:US-SANJOSE-1-AD-1' }}
+          COMPARTMENT_OCID: ${{ vars.OCI_COMPARTMENT_OCID }}
+          AD: ${{ vars.OCI_AD || 'auto' }}
           SUBNET_OCID: ${{ vars.OCI_SUBNET_OCID }}
           IMAGE_OCID: ${{ vars.OCI_IMAGE_OCID }}
+          X86_IMAGE_OCID: ${{ vars.OCI_X86_IMAGE_OCID }}
+          SSH_PUBLIC_KEY: ${{ vars.OCI_SSH_PUBLIC_KEY }}
           INSTANCE_NAME: ${{ vars.OCI_INSTANCE_NAME || 'ubuntu-arm-free' }}
+          SHAPES: ${{ vars.OCI_SHAPES || 'VM.Standard.A1.Flex,VM.Standard.E2.1.Micro' }}
           OCPUS: ${{ vars.OCI_OCPUS || '2' }}
           MEMORY_GB: ${{ vars.OCI_MEMORY_GB || '12' }}
-          # With ~1s per attempt, many attempts still finish fast. The job
-          # timeout below is the real guard against overlapping the cron.
-          MAX_ATTEMPTS: ${{ github.event.inputs.max_attempts || '30' }}
-          SLEEP_SECONDS: ${{ github.event.inputs.sleep_seconds || '3' }}
+          MAX_ATTEMPTS: ${{ inputs.max_attempts || '0' }}
+          SLEEP_SECONDS: ${{ inputs.sleep_seconds || '15' }}
+          MAX_RUNTIME_SECONDS: ${{ inputs.max_runtime_seconds || '3300' }}
         run: |
-          cp "$HOME/.oci/oci_api_key.pem" "$OCI_CLI_KEY_FILE"
-          chmod 600 "$OCI_CLI_KEY_FILE"
-          python3 scripts/hunt.py
+          export OCI_CLI_KEY_FILE="$HOME/.oci/oci_api_key.pem"
+          python scripts/hunt.py
+
+      - uses: actions/cache/save@v4
+        if: always() && hashFiles('.hunt-state/request.json') != ''
+        with:
+          path: .hunt-state
+          key: oci-hunt-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Summary
         if: always()
+        env:
+          RESULT: ${{ steps.hunt.outputs.result }}
+          INSTANCE_ID: ${{ steps.hunt.outputs.instance_id }}
+          SHAPE: ${{ steps.hunt.outputs.shape }}
+          STATE: ${{ steps.hunt.outputs.lifecycle_state }}
+          ATTEMPTS: ${{ steps.hunt.outputs.attempts }}
+          CAPACITY: ${{ steps.hunt.outputs.capacity }}
+          THROTTLED: ${{ steps.hunt.outputs.throttled }}
+          TRANSIENT: ${{ steps.hunt.outputs.transient }}
+          QUOTA: ${{ steps.hunt.outputs.quota }}
         run: |
           {
-            echo "## Oracle ARM hunt"
-            echo ""
-            echo "- result: \`${{ steps.hunt.outputs.created }}\`"
-            echo "- instance id: \`${{ steps.hunt.outputs.instance_id }}\`"
+            echo '## Oracle Always Free hunt'
+            echo "- result: ${RESULT:-step_failed}"
+            echo "- instance: ${INSTANCE_ID:-none}"
+            echo "- shape / state: ${SHAPE:-none} / ${STATE:-none}"
+            echo "- attempts: ${ATTEMPTS:-0}"
+            echo "- no capacity / throttled / transient / quota: ${CAPACITY:-0} / ${THROTTLED:-0} / ${TRANSIENT:-0} / ${QUOTA:-0}"
             echo "- ran at: $(date -u '+%Y-%m-%d %H:%M:%SZ')"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove private key
+        if: always()
+        run: rm -f "$HOME/.oci/oci_api_key.pem"

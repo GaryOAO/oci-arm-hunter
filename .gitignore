@@ -1,3 +1,6 @@
 *.pem
 *.key
 .oci/
+.hunt-state/
+__pycache__/
+*.pyc
