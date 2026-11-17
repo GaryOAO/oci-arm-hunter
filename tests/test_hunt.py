@@ -271,6 +271,51 @@ class HunterTests(unittest.TestCase):
         for shape in hunt.FREE_SHAPES:
             self.assertEqual(h.details((shape, "AD-1", "image")).metadata["ssh_authorized_keys"], "ssh-ed25519 public-key")
 
+    def test_arm_rotates_sizes_after_capacity_failure(self):
+        self.compute.launch_instance.side_effect = [error(), response(instance(shape=hunt.ARM))]
+        self.hunter(shapes=(hunt.ARM,)).run()
+        sizes = [(c.args[0].shape_config.ocpus, c.args[0].shape_config.memory_in_gbs)
+                 for c in self.compute.launch_instance.call_args_list]
+        self.assertEqual(sizes, [(2, 12), (1, 6)])
+
+    def test_smaller_pending_request_resumes_same_size_and_token(self):
+        self.compute.launch_instance.side_effect = [error(), oci.exceptions.RequestException("timeout")]
+        h = self.hunter(shapes=(hunt.ARM,), max_attempts=2)
+        with self.assertRaisesRegex(ValueError, "unconfirmed"):
+            h.run()
+        token = h.state.pending["token"]
+        self.compute.launch_instance.side_effect = None
+        self.compute.launch_instance.return_value = response(instance(shape=hunt.ARM))
+        self.hunter(shapes=(hunt.ARM,), max_attempts=1).run()
+        call = self.compute.launch_instance.call_args
+        self.assertEqual(call.kwargs["opc_retry_token"], token)
+        self.assertEqual(call.args[0].shape_config.ocpus, 1)
+
+    def test_remaining_arm_budget_only_allows_smaller_size(self):
+        other = instance(shape=hunt.ARM, name="other")
+        other.shape_config.ocpus, other.shape_config.memory_in_gbs = 1, 6
+        self.compute.list_instances.return_value = response([other])
+        self.compute.launch_instance.return_value = response(instance(shape=hunt.ARM))
+        self.hunter(shapes=(hunt.ARM,)).run()
+        details = self.compute.launch_instance.call_args.args[0]
+        self.assertEqual((details.shape_config.ocpus, details.shape_config.memory_in_gbs), (1, 6))
+
+    def test_fallback_can_be_disabled(self):
+        self.compute.launch_instance.side_effect = error()
+        self.hunter(shapes=(hunt.ARM,), arm_fallback=False).run()
+        self.assertEqual({c.args[0].shape_config.ocpus for c in self.compute.launch_instance.call_args_list}, {2})
+
+    def test_fallback_never_increases_requested_size(self):
+        self.assertEqual(self.hunter(ocpus=1, memory=4).arm_profiles(), [(1, 4)])
+
+    def test_refreshed_budget_excludes_larger_profile(self):
+        other = instance(shape=hunt.ARM, name="other")
+        other.shape_config.ocpus, other.shape_config.memory_in_gbs = 1, 6
+        self.compute.list_instances.side_effect = [response([]), response([other])]
+        self.compute.launch_instance.side_effect = [error(), response(instance(shape=hunt.ARM))]
+        self.hunter(shapes=(hunt.ARM,), interval=300).run()
+        self.assertEqual(self.compute.launch_instance.call_args.args[0].shape_config.ocpus, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

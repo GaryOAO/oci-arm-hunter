@@ -16,7 +16,7 @@
 虽然原 cron 写的是每 5 分钟。每轮运行仅几分钟，留下较长的轮询空档。
 
 新版每小时 `:17`、`:47` 触发，每轮最多轮询 55 分钟。任务串行排队，后来的任务不会取消正在抢机的任务。
-默认两次请求之间至少等待 15 秒，并增加 0–20% 随机抖动；429 后提高间隔到 30–120 秒，
+默认两次请求之间至少等待 30 秒，并增加 0–20% 随机抖动；429 后提高间隔到 30–120 秒，
 尊重数值形式的 `Retry-After`，随后逐渐恢复。GitHub 的定时触发仍可能延迟，库存也没有保证。
 
 ## 配置
@@ -47,6 +47,7 @@
 | `OCI_SHAPES` | `VM.Standard.A1.Flex,VM.Standard.E2.1.Micro`；顺序决定优先级，可仅填其中一种 |
 | `OCI_OCPUS` | `2`；只影响 ARM，最大 2 |
 | `OCI_MEMORY_GB` | `12`；只影响 ARM，最大 12 |
+| `OCI_ARM_FALLBACK` | `true`；在配置规格之外轮换尝试 1 OCPU / 6 GB；设为 `false` 关闭，备选不会超过配置规格 |
 
 两种架构分别选择镜像，x86 不使用 ARM 的 `shape_config`。
 指定的镜像会校验兼容机型，只接受无许可证费用的 Ubuntu 平台镜像。
@@ -134,3 +135,15 @@ python3 -m venv .venv
 免费额度和可用区域以 [Oracle Always Free 文档](https://docs.oracle.com/en-us/iaas/Content/FreeTier/freetier_topic-Always_Free_Resources.htm) 为准。
 另见 [Oracle 区域/AD 文档](https://docs.oracle.com/en-us/iaas/Content/General/Concepts/regions.htm)
 和 [GitHub schedule 说明](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)。
+
+## 成功 Issue 通知
+
+实例确认 `RUNNING` 后，工作流自动创建 Issue 并 @仓库所有者，提供机型、实际配置、区域和运行记录链接。
+需要工作流的 `issues: write` 权限和仓库启用 Issues。通知中不公布实例 OCID 或公网 IP。
+按实例的 SHA-256 标记检查所有分页、所有状态的 Issue；同一实例关闭 Issue 后也不会重复通知。
+创建或查询 Issue 失败会让通知步骤失败，后续定时任务确认已有实例时会再次尝试。
+`PROVISIONING`、`STOPPED` 或容量不足不会发送成功通知。
+
+ARM 默认轮换配置规格和 1 OCPU / 6 GB，并逐一检查剩余额度；不影响 `OCI_SHAPES` 指定的架构范围。
+发生超时后仍使用同一规格、请求和重试 token，跨轮恢复也不会切换规格。
+Summary 明确区分已抢到、尚未抢到和等待启动，Actions 绿色本身不代表已抢到。

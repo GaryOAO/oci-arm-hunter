@@ -11,13 +11,14 @@ on:
         default: '0'
       sleep_seconds:
         description: 'Minimum delay between attempts (at least 10 seconds)'
-        default: '15'
+        default: '30'
       max_runtime_seconds:
         description: 'Polling window in seconds (1–3300)'
         default: '3300'
 
 permissions:
   contents: read
+  issues: write
 
 concurrency:
   group: oci-arm-hunter
@@ -71,8 +72,9 @@ jobs:
           SHAPES: ${{ vars.OCI_SHAPES || 'VM.Standard.A1.Flex,VM.Standard.E2.1.Micro' }}
           OCPUS: ${{ vars.OCI_OCPUS || '2' }}
           MEMORY_GB: ${{ vars.OCI_MEMORY_GB || '12' }}
+          ARM_FALLBACK: ${{ vars.OCI_ARM_FALLBACK || 'true' }}
           MAX_ATTEMPTS: ${{ inputs.max_attempts || '0' }}
-          SLEEP_SECONDS: ${{ inputs.sleep_seconds || '15' }}
+          SLEEP_SECONDS: ${{ inputs.sleep_seconds || '30' }}
           MAX_RUNTIME_SECONDS: ${{ inputs.max_runtime_seconds || '3300' }}
         run: |
           export OCI_CLI_KEY_FILE="$HOME/.oci/oci_api_key.pem"
@@ -99,6 +101,12 @@ jobs:
         run: |
           {
             echo '## Oracle Always Free hunt'
+            case "$RESULT" in
+              created|existing) echo '✅ 已确认机器 RUNNING；下方为实例信息。' ;;
+              no_capacity|throttled|window_expired) echo '⏳ 本轮尚未抢到机器；绿色状态仅表示脚本执行正常。' ;;
+              pending_or_stopped) echo '⚠️ 实例已存在但尚未确认 RUNNING；下轮继续检查。' ;;
+              *) echo '❌ 需要检查本次运行日志。' ;;
+            esac
             echo "- result: ${RESULT:-step_failed}"
             echo "- instance: ${INSTANCE_ID:-none}"
             echo "- shape / state: ${SHAPE:-none} / ${STATE:-none}"
@@ -106,6 +114,19 @@ jobs:
             echo "- no capacity / throttled / transient / quota: ${CAPACITY:-0} / ${THROTTLED:-0} / ${TRANSIENT:-0} / ${QUOTA:-0}"
             echo "- ran at: $(date -u '+%Y-%m-%d %H:%M:%SZ')"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify running instance via Issue
+        if: success() && (steps.hunt.outputs.result == 'created' || steps.hunt.outputs.result == 'existing') && steps.hunt.outputs.lifecycle_state == 'RUNNING'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ steps.hunt.outputs.result }}
+          STATE: ${{ steps.hunt.outputs.lifecycle_state }}
+          INSTANCE_ID: ${{ steps.hunt.outputs.instance_id }}
+          SHAPE: ${{ steps.hunt.outputs.shape }}
+          OCPUS: ${{ steps.hunt.outputs.ocpus }}
+          MEMORY_GB: ${{ steps.hunt.outputs.memory_gb }}
+          REGION: ${{ vars.OCI_CLI_REGION || 'us-sanjose-1' }}
+        run: python scripts/notify.py
 
       - name: Remove private key
         if: always()

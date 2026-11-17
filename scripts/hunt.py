@@ -65,7 +65,8 @@ class Settings:
     memory: float = 12
     max_attempts: int = 0
     max_runtime: float = 3300
-    interval: float = 15
+    interval: float = 30
+    arm_fallback: bool = True
     state_file: str = ".hunt-state/request.json"
 
     def validate(self):
@@ -93,7 +94,8 @@ class Settings:
             ocpus=float(env("OCPUS", "2")), memory=float(env("MEMORY_GB", "12")),
             max_attempts=int(env("MAX_ATTEMPTS", "0")),
             max_runtime=float(env("MAX_RUNTIME_SECONDS", "3300")),
-            interval=float(env("SLEEP_SECONDS", "15")),
+            interval=float(env("SLEEP_SECONDS", "30")),
+            arm_fallback=env("ARM_FALLBACK", "true").lower() == "true",
             state_file=env("STATE_FILE", ".hunt-state/request.json"),
         )
         settings.shapes = tuple(x.strip() for x in settings.shapes)
@@ -196,15 +198,23 @@ class Hunter:
             return matches[0]
         return None
 
+    def arm_profiles(self):
+        profiles = [(self.s.ocpus, self.s.memory)]
+        if self.s.arm_fallback and self.s.ocpus >= 1 and self.s.memory >= 6:
+            profiles.append((1, 6))
+        return list(dict.fromkeys(profiles))
+
+    def arm_fits(self, instances, ocpus, memory):
+        arm = [i for i in instances if i.shape == ARM]
+        return (sum(i.shape_config.ocpus for i in arm) + ocpus <= 2
+                and sum(i.shape_config.memory_in_gbs for i in arm) + memory <= 12)
+
     def eligible_shapes(self, instances, volume_gb):
         if volume_gb + BOOT_GB > 200:
             raise ValueError(f"Free storage exhausted: {volume_gb} GB used + {BOOT_GB} GB boot > 200 GB")
-        arm = [i for i in instances if i.shape == ARM]
         micro = [i for i in instances if i.shape == X86]
-        ocpus = sum(i.shape_config.ocpus for i in arm)
-        memory = sum(i.shape_config.memory_in_gbs for i in arm)
         allowed = [shape for shape in self.s.shapes if
-                   (shape == ARM and ocpus + self.s.ocpus <= 2 and memory + self.s.memory <= 12)
+                   (shape == ARM and any(self.arm_fits(instances, *p) for p in self.arm_profiles()))
                    or (shape == X86 and len(micro) < 2)]
         if not allowed:
             raise ValueError("No requested shape fits the remaining Always Free compute allocation")
@@ -268,15 +278,26 @@ class Hunter:
                     candidates.append((shape, ad, image_id))
         if not candidates:
             raise ValueError("No Always Free shape is supported by the requested ADs/images")
-        log(f"Free storage: {volume_gb}/200 GB; placements: {[(s, a) for s, a, _ in candidates]}")
+        # Try each shape's primary size before the smaller ARM alternatives.
+        expanded, fallback = [], []
+        for candidate in candidates:
+            if candidate[0] != ARM:
+                expanded.append(candidate)
+                continue
+            for index, profile in enumerate(self.arm_profiles()):
+                if self.arm_fits(instances, *profile):
+                    (expanded if index == 0 else fallback).append((*candidate, *profile))
+        candidates = expanded + fallback
+        log(f"Free storage: {volume_gb}/200 GB; placements: {[c[:2] + c[3:] for c in candidates]}")
         return candidates, None
 
     def details(self, candidate):
-        shape, ad, image = candidate
+        shape, ad, image = candidate[:3]
+        ocpus, memory = candidate[3:] if len(candidate) == 5 else (self.s.ocpus, self.s.memory)
         return LaunchInstanceDetails(
             availability_domain=ad, compartment_id=self.s.compartment, display_name=self.s.name,
             shape=shape,
-            shape_config=LaunchInstanceShapeConfigDetails(ocpus=self.s.ocpus, memory_in_gbs=self.s.memory)
+            shape_config=LaunchInstanceShapeConfigDetails(ocpus=ocpus, memory_in_gbs=memory)
             if shape == ARM else None,  # E2.1.Micro is fixed-size; ARM settings must not leak into it.
             source_details=InstanceSourceViaImageDetails(
                 image_id=image, boot_volume_size_in_gbs=BOOT_GB, boot_volume_vpus_per_gb=10),
@@ -288,7 +309,10 @@ class Hunter:
         self.state.write(None)
         output("instance_id", instance.id)
         output("shape", instance.shape)
-        output("created", "true")
+        output("instance_name", instance.display_name)
+        if instance.shape_config:
+            output("ocpus", instance.shape_config.ocpus)
+            output("memory_gb", instance.shape_config.memory_in_gbs)
         # Acceptance is not the same as RUNNING. Never issue a second create.
         wait_deadline = min(deadline, time.monotonic() + 600)
         while instance.lifecycle_state in {"PROVISIONING", "STARTING"} and time.monotonic() + 15 < wait_deadline:
@@ -299,6 +323,7 @@ class Hunter:
             self.result = "instance_failed"
             raise ValueError(f"Instance entered {instance.lifecycle_state}; inspect its boot volume before retrying")
         self.result = ("existing" if existing else "created") if instance.lifecycle_state == "RUNNING" else "pending_or_stopped"
+        output("created", "true" if self.result in {"created", "existing"} else "false")
         log(f"Instance {instance.id}: {instance.shape}, {instance.lifecycle_state}; result={self.result}")
         return 0
 
@@ -312,12 +337,15 @@ class Hunter:
         if instance:
             return self.finish_instance(instance, deadline, existing=True)
         if self.state.pending:
-            candidates = sorted(candidates, key=lambda c: (c[0], c[1]) !=
-                                (self.state.pending["shape"], self.state.pending["ad"]))
+            # Match the whole payload: a resumed request may be the smaller size.
+            candidates = sorted(candidates, key=lambda c: hashlib.sha256(
+                json.dumps(oci.util.to_dict(self.details(c)), sort_keys=True).encode()
+            ).hexdigest() != self.state.pending["digest"])
         index = 0
         next_inventory = time.monotonic() + 300
         disabled = set()
         last_kind = None
+        instances = None
         while time.monotonic() + 20 < deadline and (not self.s.max_attempts or self.stats["attempts"] < self.s.max_attempts):
             if time.monotonic() >= next_inventory or last_kind in {"transient", "conflict"}:
                 instances, volume_gb = self.inventory()
@@ -326,7 +354,8 @@ class Hunter:
                 allowed = self.eligible_shapes(instances, volume_gb)
                 disabled.update(set(FREE_SHAPES) - set(allowed))
                 next_inventory = time.monotonic() + 300
-            available = [c for c in candidates if c[0] not in disabled]
+            available = [c for c in candidates if c[0] not in disabled
+                         and (c[0] != ARM or instances is None or self.arm_fits(instances, *c[3:]))]
             if not available:
                 self.result = "quota_blocked"
                 raise ValueError("All free shapes exhausted their allocation/service quota")
@@ -368,7 +397,8 @@ class Hunter:
                         retry_after = float(headers.get("retry-after", 0))
                     except (ValueError, TypeError):
                         pass
-                log(f"attempt {self.stats['attempts']}: {candidate[0]} in {candidate[1]}: {kind}; "
+                size = f" {details.shape_config.ocpus} OCPU/{details.shape_config.memory_in_gbs} GB" if details.shape_config else ""
+                log(f"attempt {self.stats['attempts']}: {candidate[0]}{size} in {candidate[1]}: {kind}; "
                     f"next interval >= {max(self.delay, retry_after):.0f}s")
                 if kind != "capacity":
                     log(str(error))
